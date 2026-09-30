@@ -1,0 +1,7 @@
+{
+  "model": "/absolute/path/to/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
+  "model_name": "qwen2.5-0.5b-instruct",
+  "context": 4096,
+  "host": "127.0.0.1",
+  "fit_max_tokens": true
+}

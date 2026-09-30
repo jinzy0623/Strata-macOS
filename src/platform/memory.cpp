@@ -7,6 +7,8 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <cerrno>
+#include <cstring>
 #endif
 
 namespace strata::platform {
@@ -61,7 +63,7 @@ void unlock_resident(void* p, uint64_t bytes) {
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
     if (p == nullptr || bytes == 0) { r.note = "nothing to lock"; return r; }
-    if (mlock(p, bytes) != 0) { r.note = "mlock failed (raise ulimit -l)"; return r; }
+    if (mlock(p, bytes) != 0) { r.note = std::string("mlock failed: ") + std::strerror(errno) + "; locking is optional, continue unlocked"; return r; }
     r.ok = true;
     r.locked_bytes = bytes;
     r.note = "mlock";

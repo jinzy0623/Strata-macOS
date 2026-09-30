@@ -566,7 +566,10 @@ class Service:
                 raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({self.engine.max_context}); requests are never truncated")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        thinking = kwargs.get("enable_thinking", True) is not False
+        if hasattr(self.template, "starts_in_reasoning"):
+            thinking = self.template.starts_in_reasoning(prompt)
+        return ids, thinking, max_new
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -1218,7 +1221,9 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
+    from serve.backends import backend_names, load_backend
+    plugin_names = backend_names()
+    ap.add_argument("--engine", choices=["mock", "strata", *plugin_names], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
@@ -1257,7 +1262,10 @@ def main() -> int:
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
         tok = ST.Tokenizer(tokens, merges, types)
-    if a.engine == "strata":
+    if a.engine in plugin_names:
+        bundle = load_backend(a.engine, cfg)
+        engine, tok, vision, sampling_defaults = bundle.engine, bundle.tokenizer, None, {}
+    elif a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
         vision = None
@@ -1277,10 +1285,13 @@ def main() -> int:
         engine, vision, sampling_defaults = MockEngine(tok, a.script), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    svc = Service(engine, tok, bundle.template if a.engine in plugin_names else
+                  ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    if a.engine in plugin_names:
+        svc.stop_ids = bundle.stop_ids
     svc.api_key = a.api_key or cfg.get("api_key", "")
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"

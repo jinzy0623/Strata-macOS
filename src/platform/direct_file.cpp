@@ -2,6 +2,7 @@
 #include "strata/platform/direct_file.hpp"
 
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -198,8 +199,20 @@ DirectFile::~DirectFile() { close(); delete impl_; }
 
 bool DirectFile::open(const std::string& path, std::string& err) {
     close();
+    #if defined(__APPLE__)
+    impl_->fd = ::open(path.c_str(), O_RDONLY);
+#else
     impl_->fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+#endif
     if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }
+#if defined(__APPLE__)
+    // Darwin has no O_DIRECT. Retain pread completion semantics and bypass the cache.
+    if (fcntl(impl_->fd, F_NOCACHE, 1) != 0) {
+        err = "DirectFile: F_NOCACHE failed for " + path;
+        close();
+        return false;
+    }
+#endif
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
@@ -221,7 +234,8 @@ bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t
         err = "DirectFile: unaligned request";
         return false;
     }
-    const ssize_t got = pread(impl_->fd, buffer, length, (off_t) offset);
+    ssize_t got;
+    do { got = pread(impl_->fd, buffer, length, (off_t) offset); } while (got < 0 && errno == EINTR);
     impl_->done.push_back(Completion{tag, got < 0 ? 0u : (uint32_t) got, got >= 0});
     return true;
 }

@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -42,6 +42,9 @@ option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 
 if(STRATA_ENABLE_CUDA)
+  if(APPLE)
+    message(FATAL_ERROR "CUDA is unavailable on macOS. Use setup-macos.sh and --engine metal.")
+  endif()
   enable_language(CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
@@ -110,6 +113,22 @@ target_link_libraries(strata_plan INTERFACE strata_warnings)
 
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
+
+# Apple Silicon builds portable artifact tools and the platform I/O layer.
+# Inference is supplied by the independently compiled ggml Metal plugin (setup-macos.sh).
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+  if(STRATA_ENABLE_CUDA)
+    message(FATAL_ERROR "Apple Silicon uses --engine metal; CUDA is unavailable on macOS")
+  endif()
+  add_library(strata_platform STATIC src/platform/direct_file.cpp src/platform/memory.cpp)
+  target_link_libraries(strata_platform PUBLIC strata_artifact)
+  enable_testing()
+  add_executable(strata-platform-test tests_macos/platform_test.cpp)
+  target_link_libraries(strata-platform-test PRIVATE strata_platform)
+  add_test(NAME macos_platform COMMAND strata-platform-test)
+  message(STATUS "Apple Silicon: ARM64 portable tools; Metal inference via setup-macos.sh")
+  return()
+endif()
 
 # ---- strata_core (CUDA, Phase 2) ------------------------------------------
 # Only built when CUDA is on, so the Phase 1 targets keep working on a machine with no toolkit.  The arch

@@ -1,166 +1,109 @@
-<h1 align="center">Strata</h1>
+# Strata macOS / Apple Silicon
 
-<p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>
-one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to install</p>
+基于 [Niko1221/Strata v0.1.13](https://github.com/Niko1221/Strata/releases/tag/v0.1.13)，
+上游提交 `b89c989a7155e984e544ddd90d1038dda7da9e3d`。
+这是首版 macOS 移植：保留 Strata Web UI、Python 服务端、OpenAI 兼容 API，
+通过可插拔的 llama.cpp / ggml Metal 后端运行较小 GGUF 模型。
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+**M4 MacBook Air 16GB 无法运行上游原 125B 配置。** 上游专家权重等内存需求已经超过
+16GB，SSD 并不能消除当前方案的常驻内存需求。请先用 0.5B–3B 的量化指令模型、
+较短上下文验证；模型文件、KV cache、工作区和 macOS 会共同占用统一内存。
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** - a large, smart AI model that
-normally needs a server - on your own PC. It writes its answers at **60-95 tokens per second** (a token is about ¾
-of a word): faster than you can read.
+## 已实现的路径
 
-- **Free and open source.**
+```text
+Strata Web UI / OpenAI client
+          ↓
+Python Service（现有排队、流式响应、设置、监控）
+          ↓
+Engine protocol + backend registry
+          ├─ strata    → 原 CUDA 子进程（Windows / Linux，保留）
+          ├─ metal     → llama-cpp-python → llama.cpp / ggml Metal（Apple Silicon）
+          └─ ggml-cpu  → llama.cpp / ggml CPU（调试）
+```
 
-> **Jump to:** [How fast?](#how-fast-is-it) · [Which model?](#which-model-should-i-pick) · [Install](#install) ·
-> [Using it](#using-it) · [Problems?](#something-went-wrong) · [How it works](#how-does-it-work) ·
-> [All the details](docs/DETAILS.md)
+Metal 实现使用 GGUF 自带分词器和聊天模板，支持文本聊天、SSE 流式输出、采样、
+停止 token 和请求间取消。ARM64 的 SIMD 与 Accelerate 由 ggml 提供；不会编译上游 AVX 内核。
+这不是 CUDA kernel 的逐项翻译，原 SSD expert streaming、专家缓存和 MTP 推测解码
+**尚未接入 Metal**。现阶段不支持 GGUF 工具调用和图像输入；工具请求会明确返回 400。
+部分 GGUF 模板使用尚未支持的 Jinja 扩展，因此当前实测支持范围是 Qwen2.5 Instruct GGUF。
 
----
+## 安装与启动
 
-## How fast is it?
+需要 Apple Silicon Mac、macOS 14+、原生 ARM64 Python 3.10+（建议 3.12）及
+Apple Command Line Tools。终端不能运行在 Rosetta 下。
 
-Measured on an RTX 5070 (12 GB), a Ryzen 5 7600 and 64 GB of RAM:
+```bash
+xcode-select --install   # 已安装时无需再执行
+# 如果没有 Python，可从 python.org 安装支持 Apple Silicon 的版本
 
-| Size | Writes answers (short chat) | Writes answers (128K context) | Reads your prompt |
-| --- | ---: | ---: | ---: |
-| **Q2_0** | 95 tokens/s | 65 tokens/s | 539 tokens/s |
-| **IQ2_XS** | 78 tokens/s | 52 tokens/s | 463 tokens/s |
-| **IQ3_XXS** | 66 tokens/s | 45 tokens/s | 410 tokens/s |
-| **IQ3_S** | 54 tokens/s | 42 tokens/s | 374 tokens/s |
+git clone https://github.com/jinzy0623/Strata-macOS.git
+cd Strata-macOS
+./setup-macos.sh
+```
 
-- **Writes answers** = how fast the reply appears (tokens per second).
-- **Reads your prompt** = how fast it takes in what you send (long documents, code, chat history).
+安装器创建本地 `.venv`，从固定版本 `llama-cpp-python==0.3.16` 源码构建 ggml Metal，
+构建 Strata 的 ARM64 工具和文件 I/O 层，并运行平台测试。首次需要网络和编译时间。
+可以用 `STRATA_PYTHON=/path/to/python3 ./setup-macos.sh` 指定 Python。
+不会自动下载大模型，也不会安装 CUDA。
 
-A card with more VRAM is faster, because more of the model fits on the GPU: an RTX 3090 (24 GB) should do roughly
-100-140 tokens per second. All measurements, long-context numbers and estimates for other cards are in the
-[details](docs/DETAILS.md#speed-measured).
+取得一个允许你使用的较小 GGUF 指令模型。例如本机验证采用
+[Qwen2.5-0.5B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF)
+的 `qwen2.5-0.5b-instruct-q4_k_m.gguf`（约 469 MiB）。模型许可证由其发布方提供。
 
-## Which model should I pick?
+```bash
+cp config/macos.example.json config/macos.json
+# 编辑 config/macos.json，将 model 改为你的 GGUF 绝对路径
+./run-macos.sh --config config/macos.json --open
+```
 
-**The size** (the same model, compressed more or less):
+默认网页：`http://127.0.0.1:8080/`，OpenAI base URL：`http://127.0.0.1:8080/v1`。
+按 Ctrl+C 停止。配置中的 `context` 默认 4096；上下文越大，KV cache 占用越高。
+模型文件大于当前可用内存的 80% 时会拒绝加载；这是基础检查，不能保证其他配置不耗尽内存。
+默认使用 mmap，**不强制 mlock**，避免 macOS 锁页配额导致启动失败。
 
-| Model | RAM+VRAM Requirements | Speed | Quality |
-| --- | ---: | --- | --- |
-| **Q2_0** | 37.6 GB | fastest | good |
-| **IQ2_XS** | 39.2 GB | fast | better (**recommended**) |
-| **IQ3_XXS** | 47.0 GB | slower | great |
-| **IQ3_S** | 54.8 GB | slowest | best: matches the full model on the published tests (original model only) |
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen2.5-0.5b-instruct","messages":[{"role":"user","content":"你好"}],"max_tokens":128}'
+```
 
-**Will it fit?** Shard 1 is the part of the model that gets loaded when it starts: its experts go into your **RAM**,
-the rest onto your graphics card (the second shard, a 29 GB lookup table, stays on the SSD). So it fits when your
-**RAM is at least shard 1 + about 10 GB** for Windows and your other programs. With 64 GB of RAM every size fits
-(IQ3_S with little else open); with 48 GB, Q2_0 and IQ2_XS. A bigger graphics card makes it faster, but it doesn't
-lower the RAM needed.
+需要 CPU 调试时：
 
-**The version:**
+```bash
+.venv/bin/python -m serve.server --engine ggml-cpu --config config/macos.json --port 8080
+```
 
-- **Qwen3.8-Flash-Next** - the original.
-- **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)** - a fine-tune by UkisAI
-  that thinks much shorter before answering, so you get the answer sooner, with about the same quality. Same speed per
-  token, and about the same RAM as the same size of the original (no IQ3_S). Its own license applies (see its page).
+网页保持上游设计。监控中的 NVIDIA GPU / VRAM 指标在 Mac 上显示为空；统一内存使用
+CPU/RAM 监控，当前未实现 Apple GPU 温度、功率等读数。仅在需要时开放网络监听，
+并通过 `STRATA_API_KEY` 设置 API key。
 
-Not sure? Take **IQ2_XS**. You can add another one later with `START-HERE.bat --setup`.
+## 构建和验证
 
-## Install
+```bash
+.venv/bin/cmake -S . -B build-macos -DSTRATA_ENABLE_CUDA=OFF
+.venv/bin/cmake --build build-macos --parallel 4
+.venv/bin/ctest --test-dir build-macos --output-on-failure
+.venv/bin/python -m unittest serve.test_server tests_macos.test_backend -v
+# 真实 Metal 推理验证（需要你自己的小型模型）
+.venv/bin/python -m tests_macos.smoke_gguf /absolute/path/chat-model.gguf
+```
 
-**You need:** an NVIDIA RTX 30, 40 or 50 card with 12 GB of VRAM or more, enough RAM for the size you pick (above),
-~80 GB of free disk space (an SSD makes the first start much faster), and Windows 10/11 or Linux. The only thing you
-install yourself is a current **NVIDIA driver** ([nvidia.com/drivers](https://www.nvidia.com/drivers) or the NVIDIA
-App). Everything else - Python, the engine, the model - is set up for you.
+本机 Apple M4 的实测记录见 [docs/MACOS-VALIDATION.md](docs/MACOS-VALIDATION.md)。
+CI 构建与测试不下载模型，也不代表实际 GPU 推理已在 CI 验证。
+CMake 在 Apple Silicon 下构建 `strata-gguf`、`strata-dequant`、`strata-plan` 和平台层；
+Metal 推理库由 Python 安装器独立构建。原生 CUDA `strata` 可执行文件没有移植到 Mac。
 
-**Windows**
+## 来源与许可
 
-1. [Download this project](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-2. Double-click **`START-HERE.bat`**.
-3. Answer a few questions - or just press Enter each time for the recommended choice:
-   - **Which model and size?** The original or Swift 1.5, and Q2_0, IQ2_XS, IQ3_XXS or IQ3_S - see [above](#which-model-should-i-pick)
-   - **How much context?** How much text it can keep in mind at once (it suggests one for your card)
-   - **Images?** Whether it should also read pictures
-   - **Experimental speed projection?** Off unless you say yes - [read what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) first
+保留全部上游源码、版权声明、`third_party/ggml/LICENSE`（MIT）、
+`serve/web/fonts/OFL.txt`（SIL OFL）。上游 v0.1.13 快照未包含根目录 LICENSE，本移植保留上游随后公开的
+MIT LICENSE 原文（来源提交 `a79080535d1b2a71a3419a0d97d8e7dca194b0f1`），
+保留 Niko1221 和 Strata contributors 的版权归属。
+来源和许可边界见 [ATTRIBUTION.md](ATTRIBUTION.md)。
+上游说明完整保存在 [README.upstream.md](README.upstream.md)。
 
-Then it downloads everything (the model is ~70 GB, so the first time takes a while - you can stop and it picks up
-where it left off) and **starts the model**. Your browser opens the Strata app at `http://127.0.0.1:8080`.
-
-**Next time**, just double-click `START-HERE.bat` again: it starts right away, nothing is downloaded twice. Close its
-window to stop the model.
-
-**Linux:** run `./setup.sh` - same questions, same result.
-
-## Using it
-
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
-
-- **In the browser:** `http://127.0.0.1:8080` - the Strata app (it opens by itself when the model starts): **Chat**, a
-  live **Monitor** of the model and your GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Chat in the terminal:** `.venv\Scripts\python chat.py`
-- **Your apps and coding agents:** add it as an "OpenAI-compatible" provider with base URL
-  **`http://127.0.0.1:8080/v1`**, any API key and any model name. Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages`.
-- **Thinking:** the model thinks before it answers. Choose **off, low, medium or high** - in the chat page menu, with
-  `/think low` in `chat.py`, or with your app's "reasoning effort" setting. Off is fastest; high is best for hard questions.
-- **Pictures:** in the chat page click **Picture**; in `chat.py` type `/image <path>`; in apps just attach them.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`, then open the
-  address the server window prints; see the [details](docs/DETAILS.md#using-it).
-- **Experimental speed projection (off by default):** an experimental control vector that setup can turn on; it
-  changes how the model answers - read [what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) first.
-
-**Good to know:** it answers one request at a time. The first message of a chat is read in full (about 1 minute per
-30,000 tokens); after that it keeps the conversation and reads only what is new, so follow-ups start in seconds.
-
-## Something went wrong?
-
-**My PC froze, or got very slow, the first time Strata started.**
-That's normal the first time. Strata loads 35-55 GB into your RAM, locks part of it for the graphics card, and works
-out how much of the model fits on your GPU. The mouse can freeze for a few minutes. **Wait, and don't close the
-window.** The next starts are much faster. Still frozen after 10 minutes? Restart the PC, close other programs
-(browsers use a lot of RAM) and try again. If it keeps happening, pick a smaller size (Q2_0 or IQ2_XS).
-
-**It stopped while downloading or installing.**
-Run `START-HERE.bat` again. It continues where it stopped.
-
-**It says the NVIDIA driver is too old.**
-Update it (NVIDIA App or [nvidia.com/drivers](https://www.nvidia.com/drivers)), restart the PC, and run
-`START-HERE.bat` again.
-
-**It says port 8080 is already in use.**
-Strata is already running. Look for its window.
-
-**It's very slow and the disk light keeps blinking.**
-Your PC is out of free RAM. Close other programs, or pick a smaller size (Q2_0 or IQ2_XS).
-
-**An answer stopped with "the engine stopped unexpectedly".**
-Usually not enough RAM (on Linux the system then stops the engine). Just send your message again: Strata starts the
-engine by itself. If it keeps happening, close other programs or pick a smaller size.
-
-**It says the prompt exceeds the context.**
-The conversation is longer than the context you chose. Start a new chat, or run `START-HERE.bat --setup` and pick more
-context.
-
-**Still stuck?** Look in the [full troubleshooting table](docs/DETAILS.md#troubleshooting), or open an issue and
-attach `strata-<model>.log` from the Strata folder.
-
-## How does it work?
-
-A model this big doesn't fit on a gaming graphics card. Strata splits the work between the parts of your PC:
-
-<p align="center"><img src="docs/paper/tiers.svg" width="700" alt="how Strata splits the model between GPU, RAM and SSD"></p>
-
-- **The GPU** runs the part of the model that is used for every word, plus the "experts" it needs most often.
-- **The RAM** holds all 24,576 experts, and **the CPU** computes the few the GPU doesn't have - at the same time as the GPU.
-- **The SSD** holds a big lookup table; the model reads a few rows of it per word.
-- **A small helper inside the model guesses the next words**, and Strata checks several guesses at once. That makes
-  it 1.6-1.8x faster than going word by word - and the answer is exactly the same.
-
-The full story is in the [paper](docs/paper/Strata-Paper.pdf) and the [details](docs/DETAILS.md).
-
-## Credits
-
-- Model: [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; compressed versions by
-  [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF);
-  [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI. Their licenses apply
-  to the model files.
-- Built with parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT). Ideas from
-  [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
-  [HyperQwen](https://github.com/syv-ai/HyperQwen). More in the [details](docs/DETAILS.md#credits-and-licenses).
+English: This is an initial Apple Silicon port with a working small-GGUF Metal
+inference path, the original Python API and Web UI. It does not port Strata's
+CUDA expert streaming or MTP features. A 16GB M4 cannot run the original 125B
+configuration. Start with Qwen2.5 0.5B Instruct Q4_K_M and a short context.
