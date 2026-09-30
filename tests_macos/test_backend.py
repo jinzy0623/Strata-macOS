@@ -1,4 +1,6 @@
 import threading
+import tempfile
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 from serve.backends import load_backend
@@ -55,6 +57,13 @@ class BackendTests(unittest.TestCase):
         with patch('serve.backends.ggml.platform.machine', return_value='x86_64'):
             with self.assertRaisesRegex(ValueError, 'native ARM64'):
                 create_backend({}, metal=True)
+
+    def test_missing_shard_is_rejected_before_native_load(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'model-00001-of-00002.gguf'
+            path.write_bytes(b'GGUF')
+            with self.assertRaisesRegex(ValueError, 'Missing GGUF shards'):
+                create_backend({'model': str(path)}, metal=False)
 
     def test_unknown_backend(self):
         with self.assertRaisesRegex(ValueError, 'unknown backend'):

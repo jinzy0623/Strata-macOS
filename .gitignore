@@ -51,3 +51,7 @@ build-vision.bat
 /config/macos.json
 /config/*.shared-settings.json
 !/run-macos.sh
+/.tools/
+/config/install-report.json
+/config/install-report.failed.json
+/config/install-state.json

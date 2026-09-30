@@ -948,7 +948,9 @@ def make_handler(svc: Service):
                 self.wfile.write(body)
             elif path == "/health":
                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
-                                 "images": svc.vision is not None, "api_key": bool(svc.api_key)})
+                                 "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                 "backend": getattr(svc.engine, "info", {}).get("backend"),
+                                 "installation_id": getattr(svc.engine, "info", {}).get("installation_id")})
             elif path == "/status":
                 with svc.status_lock:
                     s = dict(svc.status)

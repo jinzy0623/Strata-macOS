@@ -6,6 +6,7 @@ expert cache. ggml supplies ARM NEON/Accelerate, Metal kernels and mmap.
 from __future__ import annotations
 
 import platform
+import re
 import time
 from pathlib import Path
 
@@ -46,7 +47,7 @@ class GGMLBackend:
     def __init__(self, model, *, metal):
         self.model = model
         self.max_context = model.n_ctx()
-        self.info = {"backend": "metal" if metal else "ggml-cpu", "version": "0.1.13-macos.1",
+        self.info = {"backend": "metal" if metal else "ggml-cpu", "version": "0.1.13-macos.2",
                      "architecture": platform.machine(), "expert_streaming": False}
         self.last = {}
 
@@ -95,7 +96,15 @@ def create_backend(config, *, metal=True):
     # Avoid loading a known impossible configuration. Leave room for macOS and KV.
     import psutil
     available = psutil.virtual_memory().available
-    if path.stat().st_size > available * 0.8:
+    match = re.search(r"-\d{5}-of-(\d{5})\.gguf$", path.name)
+    paths = [path]
+    if match:
+        total = int(match.group(1))
+        prefix = path.name[:match.start()]
+        paths = [path.with_name(f"{prefix}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total + 1)]
+        if not all(p.is_file() for p in paths):
+            raise ValueError("Missing GGUF shards; rerun the installer to finish downloading all parts")
+    if sum(p.stat().st_size for p in paths) > available * 0.8:
         raise ValueError("GGUF is too large for available unified memory; select a smaller quantized model")
     from llama_cpp import Llama, llama_cpp
     if metal and not llama_cpp.llama_supports_gpu_offload():
@@ -115,7 +124,9 @@ def create_backend(config, *, metal=True):
             ids = tok.encode(special, parse_special=True)
             if len(ids) == 1:
                 stops.add(ids[0])
-        return BackendBundle(GGMLBackend(model, metal=metal), tok, GGMLTemplate(model, source), stops)
+        engine = GGMLBackend(model, metal=metal)
+        engine.info["installation_id"] = config.get("installation_id")
+        return BackendBundle(engine, tok, GGMLTemplate(model, source), stops)
     except BaseException:
         model.close()
         raise
