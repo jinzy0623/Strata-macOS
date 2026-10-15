@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import tempfile
@@ -40,9 +41,28 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            images_of, openai_to_messages)
+                            images_of, openai_to_messages, repeated_passage_coverage)
+
+from serve.mcp import McpCancelled, hub_from_config
 
 IM_END = "<|im_end|>"
+
+# Reasoning guards (ported from upstream Strata 0.1.39/0.1.40, #123 #728 #1053).  A reply whose thinking ends
+# with the end-of-turn token and no answer, goes round in circles, or passes its budget is closed once with
+# `</think>` and the model answers from the prefix the engine already holds.
+REASONING_CLOSE = "\n</think>\n\n"
+REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+REASONING_GUARD_FROM, REASONING_GUARD_EVERY = 512, 256     # look for loops from this many thinking tokens, then every N
+REASONING_LOOP_COVERAGE = 0.4                              # repeated_passage_coverage at or above this = a loop
+MCP_REPEAT_NOTE = ("This exact tool call was already made in this turn; its result is above. Do not call tools "
+                   "again: answer the user now, in plain text.")
+REASONING_CUT_NOTES = {
+    "stopped": "[strata] the reply ended inside its thinking with no answer: closing the thinking once and "
+               "continuing (reasoning_close_retry)",
+    "loop": "[strata] repeated reasoning after {n} thinking tokens: closing the thinking and answering "
+            "(reasoning_loop_guard)",
+    "budget": "[strata] thinking budget reached ({n} tokens): wrapping up the thinking (reasoning_budget_tokens)",
+}
 IMAGE_PAD = "<|image_pad|>"
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 
@@ -433,7 +453,11 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.mcp = None
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
+        self.reasoning_close_retry = True             # close a reply that ended inside its thinking, once
+        self.reasoning_loop_guard = True              # close thinking that repeats itself (see REASONING_*)
+        self.reasoning_budget_tokens = 0              # cap the thinking at N tokens for every request; 0 = none
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
@@ -520,7 +544,8 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         return {"engine": engine, "live": live, "requests": hist[::-1], "hardware": tel["now"], "hardware_static":
-                tel["static"], "history": tel["history"], "time": now}
+                tel["static"], "history": tel["history"], "time": now,
+                "mcp": self.mcp.status() if self.mcp else {"servers": [], "tools": 0}}
 
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
@@ -570,6 +595,24 @@ class Service:
         if hasattr(self.template, "starts_in_reasoning"):
             thinking = self.template.starts_in_reasoning(prompt)
         return ids, thinking, max_new
+
+    def _reasoning_budget(self, req) -> int:
+        """The thinking cap for this request: its own reasoning_budget_tokens, else the config's.  Either is a
+        number for every request or a map by effort ({"low": 2000, "medium": 8000}; an effort not named is
+        uncapped), since a request that asked to think hard should be allowed to.  0 = none."""
+        req = req if isinstance(req, dict) else {}
+        value = req.get("reasoning_budget_tokens")
+        if value is None:
+            value = self.reasoning_budget_tokens
+        if isinstance(value, dict):
+            effort = req.get("reasoning_effort") or (req.get("output_config") or {}).get("effort") or "high"
+            effort = {"xhigh": "high", "max": "high", "maximum": "high", "none": "none", "off": "none"}.get(
+                str(effort).strip().lower(), str(effort).strip().lower())
+            value = value.get(effort, 0)
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -631,38 +674,82 @@ class Service:
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                        started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
                 last_print = time.time()
-                gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
-                    self.engine.generate(ids, max_new, sampling, cancel)
-                try:
-                    for t in gen:
-                        if t is None:                   # heartbeat while the engine is quiet
-                            last_print = self._progress(last_print)
-                            yield "ping", None
-                            continue
-                        n += 1
-                        if t in self.stop_ids:
-                            finish = "stop"
+                budget = self._reasoning_budget(sampling)
+                prompt_ids, gen_ids = list(ids), []     # a continuation pass prompts with the ids + what was generated
+                reason_n, reason_text = 0, ""           # thinking tokens so far, and the thinking's recent text
+                closed, answered, guard_at = False, False, REASONING_GUARD_FROM
+                while True:
+                    cut = None                          # "stopped" | "loop" | "budget": why the thinking is closed
+                    gen = self.engine.generate(prompt_ids, max_new - n, sampling, cancel, embeddings=emb) if emb \
+                        else self.engine.generate(prompt_ids, max_new - n, sampling, cancel)
+                    try:
+                        for t in gen:
+                            if t is None:               # heartbeat while the engine is quiet
+                                last_print = self._progress(last_print)
+                                yield "ping", None
+                                continue
+                            n += 1
+                            if t in self.stop_ids:
+                                finish = "stop"
+                                raw_ids.append(t)
+                                if (self.reasoning_close_retry and thinking and not closed and not answered
+                                        and parser.state == "reasoning"):
+                                    cut = "stopped"     # #1053: reasoning, then end-of-turn, no </think>, no answer
+                                break
                             raw_ids.append(t)
-                            break
+                            gen_ids.append(t)
+                            evs = parser.feed(detok.push(t))
+                            self._note(n, evs)
+                            last_print = self._progress(last_print)
+                            for ev in evs:
+                                if ev.kind == "reasoning":
+                                    reason_text = (reason_text + (ev.text or ""))[-6000:]
+                                elif ev.kind != "content" or (ev.text or "").strip():
+                                    answered = True     # content with text, or any tool call
+                                yield "event", ev
+                            if parser.state == "reasoning" and not closed:
+                                reason_n += 1
+                                if budget and reason_n >= budget:
+                                    cut = "budget"
+                                    break
+                                if self.reasoning_loop_guard and reason_n >= guard_at:
+                                    guard_at += REASONING_GUARD_EVERY
+                                    if repeated_passage_coverage(reason_text) >= REASONING_LOOP_COVERAGE:
+                                        cut = "loop"
+                                        break
+                        if cancel.is_set():
+                            finish = "cancel"
+                    except EngineDied as e:
+                        finish = "error"
+                        note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
+                        print(f"[strata] {e}. {note} The next request starts the engine again."
+                              f"{' Its log: ' + self.engine.log_path if getattr(self.engine, 'log_path', None) else ''}",
+                              flush=True)
+                        raise
+                    finally:
+                        gen.close()                     # STOP+drain to THIS request's DONE while still holding the
+                        #                                 fifo, so a stop-token break can't leave the shared engine
+                        #                                 queue mid-drain for the next request to read as its own DONE
+                    if cut is None or cancel.is_set():
+                        break
+                    # Close the thinking the way the model would and let it answer: the next pass prompts with
+                    # what was generated plus the close, so the engine continues from the prefix it already holds.
+                    closed = True
+                    extra = self.tok.encode(REASONING_CLOSE if cut == "stopped" else REASONING_WRAP_UP,
+                                            parse_special=True)
+                    if max_new - n - len(extra) < 1:
+                        break                           # no room left to answer: "length", as before
+                    print(REASONING_CUT_NOTES[cut].format(n=reason_n), flush=True)
+                    for t in extra:
+                        n += 1
                         raw_ids.append(t)
+                        gen_ids.append(t)
                         evs = parser.feed(detok.push(t))
                         self._note(n, evs)
-                        last_print = self._progress(last_print)
                         for ev in evs:
                             yield "event", ev
-                    if cancel.is_set():
-                        finish = "cancel"
-                except EngineDied as e:
-                    finish = "error"
-                    note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
-                    print(f"[strata] {e}. {note} The next request starts the engine again."
-                          f"{' Its log: ' + self.engine.log_path if getattr(self.engine, 'log_path', None) else ''}",
-                          flush=True)
-                    raise
-                finally:
-                    gen.close()                         # STOP+drain to THIS request's DONE while still holding the
-                    #                                     fifo, so a stop-token break can't leave the shared engine
-                    #                                     queue mid-drain for the next request to read as its own DONE
+                    prompt_ids = list(ids) + gen_ids
+                    finish = "length"
         except GeneratorExit:                           # the client disconnected mid-stream
             finish = "disconnect"
             raise
@@ -712,7 +799,110 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 
 
 # ------------------------------------------------------------------------------------------------ OpenAI
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):
+def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
+                 mcp_names):
+    """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
+    the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
+    Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
+    one ("done", ...) at the very end with the output tokens of every round.
+
+    `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
+    turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
+    could not reach the model before the client's)."""
+    max_rounds = int(hub.settings["max_rounds"])
+    total, rounds, done = 0, 0, None
+    seen_calls, repeat_rounds = set(), 0      # a call repeated with the same arguments is a loop, not a new step
+    messages = list(messages)
+    while True:
+        text, reasoning, calls, own_calls = [], [], [], 0
+        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel):
+            if kind == "done":
+                done = x
+                continue
+            if kind == "event":
+                ev: Event = x
+                if ev.call is not None and ev.call.name in mcp_names:
+                    if ev.kind == "tool_start":          # the model has started writing a call: say so at once
+                        yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
+                    elif ev.kind == "tool_call":
+                        calls.append(ev.call)
+                    continue                             # its argument pieces are not streamed to the client
+                if ev.kind == "tool_call":
+                    own_calls += 1
+                elif ev.kind == "content":
+                    text.append(ev.text)
+                elif ev.kind == "reasoning":
+                    reasoning.append(ev.text)
+            yield kind, x
+        total += done["completion_tokens"]
+        run_them = calls and not own_calls and done["finish"] == "stop" and not cancel.is_set()
+        if run_them and rounds >= max_rounds:
+            yield "mcp", {"event": "limit", "max_rounds": max_rounds}
+            run_them = False
+        if not run_them:
+            for c in calls:                              # announced, never run: close them in the client's view
+                yield "mcp", {"event": "result", "id": c.id, "ok": False, "skipped": True, "text": "not run",
+                              "chars": 0, "truncated": False, "ms": 0}
+            break
+        rounds += 1
+        signatures = [(c.name, json.dumps(c.arguments, sort_keys=True, ensure_ascii=False)) for c in calls]
+        repeat_rounds = repeat_rounds + 1 if all(sig in seen_calls for sig in signatures) else 0
+        if repeat_rounds >= 2:                           # told once to stop repeating itself, and did it again
+            for c in calls:
+                yield "mcp", {"event": "result", "id": c.id, "ok": False, "skipped": True, "text": "not run",
+                              "chars": 0, "truncated": False, "ms": 0}
+            break
+        results = []
+        for c, sig in zip(calls, signatures):
+            if sig in seen_calls:                        # seen live: snapshot, loop, snapshot, ... 8 rounds, no answer
+                yield "mcp", {"event": "result", "id": c.id, "ok": False, "skipped": True, "text": MCP_REPEAT_NOTE,
+                              "chars": len(MCP_REPEAT_NOTE), "truncated": False, "ms": 0}
+                results.append(MCP_REPEAT_NOTE)
+                continue
+            seen_calls.add(sig)
+            s, tool = hub.routes().get(c.name, (None, c.name))
+            yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
+                          "tool": tool, "arguments": c.arguments, "round": rounds}
+            # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
+            # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
+            box = {}
+
+            def work(c=c, box=box):
+                try:
+                    box["r"] = hub.call(c.name, c.arguments, cancel)
+                except McpCancelled:
+                    box["cancelled"] = True
+            worker = threading.Thread(target=work, daemon=True)
+            worker.start()
+            try:
+                while worker.is_alive():
+                    worker.join(1.0)
+                    if worker.is_alive():
+                        yield "ping", None
+            except GeneratorExit:
+                cancel.set()                             # the client is gone: stop the tool too
+                raise
+            if "r" not in box:
+                break
+            r = box["r"]
+            print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
+                  f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
+            results.append(r["text"])
+            yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
+        if cancel.is_set() or len(results) < len(calls):
+            done = {**done, "finish": "cancel"}
+            break
+        messages.append({"role": "assistant", "content": "".join(text).strip(),
+                         **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
+                         "tool_calls": [{"id": c.id, "function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
+        messages += [{"role": "tool", "tool_call_id": c.id, "content": r} for c, r in zip(calls, results)]
+        yield "mcp", {"event": "history", "messages": messages[-(len(calls) + 1):]}
+        ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req)
+    yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
+
+
+
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None):
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
 
     def chunk(delta, finish=None):
@@ -722,8 +912,12 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     yield chunk({"role": "assistant", "content": ""})
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
-        if kind == "ping":
+    for kind, x in (run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel)):
+        if kind == "mcp":
+            c = chunk({})
+            c["strata_mcp"] = x
+            yield c
+        elif kind == "ping":
             yield None
         elif kind == "event":
             ev: Event = x
@@ -748,16 +942,19 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         else:
             finish = "tool_calls" if calls and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
             last = chunk({}, finish)
-            last["usage"] = {"prompt_tokens": len(ids), "completion_tokens": x["completion_tokens"],
-                             "total_tokens": len(ids) + x["completion_tokens"]}
+            prompt_tokens = x.get("prompt_tokens", len(ids))
+            last["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": x["completion_tokens"],
+                             "total_tokens": prompt_tokens + x["completion_tokens"]}
             yield last
 
 
 def openai_collect(chunks) -> dict:
-    content, reasoning, by_index, last = [], [], {}, None
+    content, reasoning, by_index, last, mcp_events = [], [], {}, None, []
     for c in chunks:
         if c is None:                              # a heartbeat
             continue
+        if c.get("strata_mcp"):
+            mcp_events.append(c["strata_mcp"])
         d = c["choices"][0]["delta"]
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
@@ -773,6 +970,8 @@ def openai_collect(chunks) -> dict:
     msg = {"role": "assistant", "content": "".join(content) or None}
     if "".join(reasoning):
         msg["reasoning_content"] = "".join(reasoning)
+    if mcp_events:
+        msg["strata_mcp"] = mcp_events
     if calls:
         msg["tool_calls"] = calls
     return {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
@@ -935,6 +1134,10 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, svc.metrics())
                 return
+            if path == "/mcp":
+                if self._authorized():
+                    self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
+                return
             if path == "/settings":
                 if self._authorized():
                     self._json(200, {"shared": bool(svc.shared), "defaults": svc.shared})
@@ -1018,11 +1221,25 @@ def make_handler(svc: Service):
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             messages, tools, kw = openai_to_messages(req)
-            max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest of the context
+            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)
+            extra = []
+            use_mcp = req.get("strata_mcp") is True and svc.mcp is not None
+            if use_mcp:
+                if not self.headers.get("Content-Type", "").startswith("application/json"):
+                    return self._json(415, {"error": {"message": "send application/json"}})
+                origin = self.headers.get("Origin")
+                if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
+                    return self._json(403, {"error": {"message": "tools can only be used from Strata's own page"}})
+                svc.mcp.wait(10)
+                extra = svc.mcp.template_tools(exclude={t.get("name") for t in tools or []})
+                tools = (tools or []) + extra or None
+                use_mcp = bool(extra)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel)
+            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                               {t["name"] for t in extra}) if use_mcp else None
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
@@ -1037,7 +1254,7 @@ def make_handler(svc: Service):
             except OSError:
                 cancel.set()                                 # client went away: stop the engine
                 chunks.close()
-            except EngineDied as e:                          # mid-stream: say so, then end the stream properly
+            except (EngineDied, ValueError) as e:            # report errors after the stream has started
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
@@ -1241,8 +1458,10 @@ def main() -> int:
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
     ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY")
+    ap.add_argument("--mcp-config", help="JSON file with an mcpServers block")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    hub = hub_from_config(cfg, a.mcp_config)
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
@@ -1295,6 +1514,12 @@ def main() -> int:
     if a.engine in plugin_names:
         svc.stop_ids = bundle.stop_ids
     svc.api_key = a.api_key or cfg.get("api_key", "")
+    svc.reasoning_close_retry = cfg.get("reasoning_close_retry", True) is not False
+    svc.reasoning_loop_guard = cfg.get("reasoning_loop_guard", True) is not False
+    svc.reasoning_budget_tokens = cfg.get("reasoning_budget_tokens") or 0      # a number, or a map by effort
+    if hub:
+        svc.mcp = hub
+        hub.start()
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
@@ -1328,10 +1553,15 @@ def main() -> int:
     if a.open:
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
+    def stop_server(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop_server)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
         httpd.shutdown()
+        if hub:
+            hub.close()
         if hasattr(engine, "close"):
             engine.close()
         if vision:

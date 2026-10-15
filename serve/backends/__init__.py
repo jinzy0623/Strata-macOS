@@ -43,3 +43,11 @@ def _ggml(config, *, metal):
 
 register_backend("metal", lambda config: _ggml(config, metal=True))
 register_backend("ggml-cpu", lambda config: _ggml(config, metal=False))
+
+
+def _llama_server(config):
+    from .llama_server import create_backend
+    return create_backend(config)
+
+
+register_backend("llama-server", _llama_server)

@@ -14,7 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, MockEngine, Service, serve  # noqa: E402
+from serve.frontend import repeated_passage_coverage  # noqa: E402
+from serve.server import CTX_SLACK, IM_END, ByteTokenizer, EngineDied, MockEngine, Service, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -25,6 +26,126 @@ class RecordingEngine(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_max_new = max_new
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class PassEngine(MockEngine):
+    """One scripted completion per generate() call, so the server's continuation passes are visible."""
+
+    def __init__(self, tok, scripts, max_context=CTX):
+        super().__init__(tok, scripts[0], max_context)
+        self.scripts = [tok.encode(s, parse_special=True) + tok.encode(IM_END, parse_special=True) for s in scripts]
+        self.prompts = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        script = self.scripts[min(len(self.prompts) - 1, len(self.scripts) - 1)]
+        for t in script[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class ReasoningGuards(unittest.TestCase):
+    """A reply that ends inside its thinking, goes round in circles there, or passes its thinking budget is
+    closed once (`</think>`) and the model answers from what it already holds."""
+
+    def serve_with(self, scripts, **attrs):
+        tok = ByteTokenizer()
+        engine = PassEngine(tok, scripts)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        for key, value in attrs.items():
+            setattr(svc, key, value)
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return engine, f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    def ask(self, base, **extra):
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], **extra}
+        req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            b = json.loads(r.read())
+        msg = b["choices"][0]["message"]
+        return (msg.get("content") or "", msg.get("reasoning_content") or "", b["choices"][0]["finish_reason"],
+                b["usage"]["completion_tokens"])
+
+    def test_a_reply_that_ends_inside_its_thinking_is_closed_and_answered(self):
+        engine, base = self.serve_with(["Let me think.", "The answer is 42."])
+        content, reasoning, finish, _ = self.ask(base)
+        self.assertEqual(content, "The answer is 42.")
+        self.assertIn("Let me think.", reasoning)
+        self.assertEqual(finish, "stop")
+        tok = ByteTokenizer()
+        self.assertEqual(engine.prompts, [engine.prompts[0],
+                                          engine.prompts[0] + tok.encode("Let me think.") + tok.encode("\n</think>\n\n")])
+
+    def test_the_thinking_is_closed_only_once(self):
+        engine, base = self.serve_with(["Hmm.", ""])           # the second pass ends at once, with no answer
+        content, _, finish, _ = self.ask(base)
+        self.assertEqual(content, "")
+        self.assertEqual(finish, "stop")
+        self.assertEqual(len(engine.prompts), 2)
+
+    def test_a_reply_that_answered_is_not_continued(self):
+        engine, base = self.serve_with(["</think>\n\nHello.", "unused"])
+        content, _, _, _ = self.ask(base)
+        self.assertEqual(content, "Hello.")
+        self.assertEqual(len(engine.prompts), 1)
+
+    def test_the_close_retry_can_be_turned_off(self):
+        engine, base = self.serve_with(["Let me think.", "The answer."], reasoning_close_retry=False)
+        content, _, _, _ = self.ask(base)
+        self.assertEqual(content, "")
+        self.assertEqual(len(engine.prompts), 1)
+
+    def test_looping_reasoning_is_cut_short_and_answered(self):
+        loop = "- Tavaires? no.\n" * 400                      # 6,400 tokens of the same line
+        engine, base = self.serve_with(["Candidates:\n" + loop, "Tavira."])
+        content, reasoning, _, n = self.ask(base)
+        self.assertEqual(content, "Tavira.")
+        self.assertLess(n, 2000)                               # cut a few hundred tokens into the loop
+        self.assertIn("long enough", reasoning)                # the wrap-up sentence closes the thinking
+        self.assertEqual(len(engine.prompts), 2)
+
+    def test_the_loop_guard_can_be_turned_off(self):
+        loop = "- Tavaires? no.\n" * 100
+        engine, base = self.serve_with([loop, "Tavira."], reasoning_loop_guard=False, reasoning_close_retry=False)
+        content, _, _, n = self.ask(base)
+        self.assertEqual(content, "")
+        self.assertEqual(len(engine.prompts), 1)
+        self.assertEqual(n, 1600 + 1)
+
+    def test_a_thinking_budget_closes_the_thinking(self):
+        engine, base = self.serve_with(["x" * 1000, "Done."], reasoning_budget_tokens=100)
+        content, reasoning, _, _ = self.ask(base)
+        self.assertEqual(content, "Done.")
+        self.assertLess(len(reasoning), 200)
+        self.assertEqual(len(engine.prompts), 2)
+
+    def test_a_request_s_own_budget_wins(self):
+        engine, base = self.serve_with(["x" * 1000, "Done."])
+        content, reasoning, _, _ = self.ask(base, reasoning_budget_tokens=50)
+        self.assertEqual(content, "Done.")
+        self.assertLess(len(reasoning), 150)
+
+    def test_a_budget_by_effort_caps_only_the_efforts_it_names(self):
+        for effort, want in (("low", "Done."), ("medium", "Done."), ("high", ""), (None, "")):
+            with self.subTest(effort=effort):
+                engine, base = self.serve_with(["x" * 1000, "Done."], reasoning_close_retry=False,
+                                               reasoning_budget_tokens={"low": 100, "medium": 400})
+                extra = {"reasoning_effort": effort} if effort else {}
+                content, reasoning, _, _ = self.ask(base, **extra)
+                self.assertEqual(content, want)
+                self.assertEqual(len(engine.prompts), 2 if want else 1)
+                if effort == "medium":
+                    self.assertGreater(len(reasoning), 300)
+
+    def test_distinct_lines_are_not_a_loop(self):
+        prose = "\n".join(f"Step {i}: consider the {i}th candidate city and its wine region." for i in range(60))
+        self.assertLess(repeated_passage_coverage(prose), 0.1)
+        self.assertGreater(repeated_passage_coverage("- Tavaires? no.\n" * 40), 0.9)
+        self.assertEqual(repeated_passage_coverage(""), 0.0)
 
 
 class MaxTokens(unittest.TestCase):

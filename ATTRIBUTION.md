@@ -15,6 +15,10 @@
   https://github.com/abetlen/llama-cpp-python
 - Outfit font: SIL Open Font License 1.1, `serve/web/fonts/OFL.txt` retained.
 - Models are not included in the repository; their authors' licenses apply.
+- MCP transport, process containment, fake server, regression tests and the
+  tool execution loop are backported from Niko1221/Strata commit
+  `6f32ec070f23ced9f50e704d854d775da52591ab` (MIT), with macOS integration,
+  a tool allowlist and browser conversation history added locally.
 - macOS additions are identified by the port commit and `serve/backends/`,
   `tests_macos/`, `setup-macos.sh`, `run-macos.sh`, and the macOS documentation.
   The original MIT copyright notice and dependency-specific terms are preserved.

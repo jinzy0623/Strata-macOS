@@ -1,0 +1,66 @@
+{
+  "llama_server_url": "http://127.0.0.1:8096",
+  "model_name": "qwen3.8-flash-next",
+  "mcp_servers": {
+    "files": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem@2026.8.31",
+        "/Users/YOUR_USER/Strata-workspace"
+      ],
+      "tools": [
+        "read_text_file",
+        "write_file",
+        "list_directory",
+        "search_files",
+        "get_file_info",
+        "list_allowed_directories"
+      ]
+    },
+    "web": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@0.0.83",
+        "--browser",
+        "chrome",
+        "--headless",
+        "--isolated",
+        "--image-responses",
+        "omit",
+        "--codegen",
+        "none",
+        "--no-webmcp",
+        "--timeout-navigation",
+        "30000",
+        "--timeout-action",
+        "10000",
+        "--output-dir",
+        "/Users/YOUR_USER/Strata-workspace/browser-output"
+      ],
+      "cwd": "/Users/YOUR_USER/Strata-workspace",
+      "tools": [
+        "browser_navigate",
+        "browser_navigate_back",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_press_key",
+        "browser_wait_for",
+        "browser_tabs"
+      ]
+    }
+  },
+  "mcp": {
+    "timeout_s": 60,
+    "max_result_chars": 6000,
+    "max_rounds": 8
+  },
+  "reasoning_close_retry": true,
+  "reasoning_loop_guard": true,
+  "reasoning_budget_tokens": {
+    "low": 2000,
+    "medium": 8000
+  }
+}

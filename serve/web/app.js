@@ -153,6 +153,10 @@ async function poll() {
       lastMetrics = await r.json();
       metricsFailures = 0;
       render(lastMetrics);
+      const mcp = lastMetrics.mcp || {servers: [], tools: 0};
+      $("mcp-summary").textContent = mcp.servers.length ?
+        mcp.servers.map((s) => `${s.name}: ${s.status}${s.error ? " — " + s.error : ""}`).join(" · ") + ` · ${mcp.tools} tools available` :
+        "No tool servers configured";
     } else {
       throw new Error(`HTTP ${r.status}`);
     }
@@ -388,7 +392,7 @@ function markdown(text) {
 }
 
 // ------------------------------------------------------------------ Chat
-const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true};
+const DEFAULTS = {thinking: "none", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, tools: false};
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
 let messages = store.get("chat", []);
 let attachments = [];                 // {name, url}
@@ -437,7 +441,7 @@ function msgEl(m, i) {
   } else {
     el.innerHTML = `<details class="st-collapse" hidden><summary>${icon("thinking", "st-icon st-icon--sm")}<span class="think-title"></span>` +
       `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body thinking"></div></details>` +
-      `<div class="st-bubble"></div><div class="st-msg__meta"><span class="meta-text"></span>` +
+      `<div class="tool-activity"></div><div class="st-bubble"></div><div class="st-msg__meta"><span class="meta-text"></span>` +
       `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the answer" title="Copy">${icon("copy")}</button></div>`;
     updateAssistant(el, m, false);
   }
@@ -456,6 +460,20 @@ function updateAssistant(el, m, streaming) {
     // open while it streams (if wanted), closed once the answer starts - unless the user toggled it themselves
     if (thinkingNow && settings.show && !det.dataset.touched && !det.open) { det._auto = true; det.open = true; }
     if (!thinkingNow && det.open && !det.dataset.touched) { det._auto = true; det.open = false; }
+  }
+  const activity = el.querySelector(".tool-activity");
+  activity.replaceChildren();
+  for (const tool of m.toolActivity || []) {
+    const detail = document.createElement("details");
+    detail.className = "st-collapse";
+    const summary = document.createElement("summary");
+    summary.textContent = `${tool.name} · ${tool.text != null ? (tool.ok ? "Done" : "Failed") : (streaming ? "Running…" : "Not run")}`;
+    const result = document.createElement("pre");
+    result.className = "st-collapse__body";
+    result.style.whiteSpace = "pre-wrap";
+    result.textContent = (tool.arguments ? JSON.stringify(tool.arguments, null, 2) + "\n\n" : "") + (tool.text || "");
+    detail.append(summary, result);
+    activity.append(detail);
   }
   const bubble = el.querySelector(".st-bubble");
   if (m.error) {
@@ -492,7 +510,7 @@ $("chat").addEventListener("toggle", (e) => {
   if (d._auto) { d._auto = false; return; }          // our own open/close, not the user's
   d.dataset.touched = "1";
   const body = d.querySelector(".thinking");
-  if (d.open && body.dataset.pending) { body.textContent = messages[+d.closest(".st-msg").dataset.i].reasoning; delete body.dataset.pending; }
+  if (body && d.open && body.dataset.pending) { body.textContent = messages[+d.closest(".st-msg").dataset.i].reasoning; delete body.dataset.pending; }
 }, true);
 
 function apiMessages() {
@@ -503,8 +521,11 @@ function apiMessages() {
       const text = userText(m);
       out.push({role: "user", content: imgs.length ? [{type: "text", text},
         ...imgs.map((i) => ({type: "image_url", image_url: {url: i.url}}))] : text});
-    } else if (m.text && !m.error) {
-      out.push({role: "assistant", content: m.text});
+    } else if (!m.error) {
+      out.push(...(m.toolHistory || []));
+      if (m.toolHistory && m.toolHistory.length) {
+        if (m.afterTools) out.push({role: "assistant", content: m.afterTools});
+      } else if (m.text) out.push({role: "assistant", content: m.text});
     }
   }
   return out;
@@ -534,7 +555,7 @@ async function send() {
   setBusy(true);
 
   const body = {model: health.model, messages: apiMessages(), stream: true,
-                reasoning_effort: settings.thinking};
+                reasoning_effort: settings.thinking, strata_mcp: settings.tools === true};
   if (settings.temperature > 0) {
     Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
   } else {
@@ -572,12 +593,27 @@ async function send() {
         try { j = JSON.parse(data); } catch (e) { continue; }
         if (j.error) throw new Error(j.error.message || "the engine reported an error");
         if (j.usage) usage = j.usage;
+        if (j.strata_mcp) {
+          const event = j.strata_mcp;
+          if (event.event === "history") {
+            (m.toolHistory ||= []).push(...event.messages);
+            m.afterTools = "";
+          } else if (["start", "call", "result"].includes(event.event)) {
+            const activity = (m.toolActivity ||= []);
+            let tool = activity.find((item) => item.id === event.id);
+            if (!tool) { tool = {id: event.id}; activity.push(tool); }
+            Object.assign(tool, event);
+          } else if (event.event === "limit") {
+            toast("warn", "Tool limit reached", "Start a follow-up message to continue.");
+          }
+        }
         const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
         if (d.reasoning_content) { if (!firstAt) firstAt = performance.now(); if (!thinkStart) thinkStart = performance.now(); m.reasoning += d.reasoning_content; }
         if (d.content) {
           if (!firstAt) firstAt = performance.now();
           if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
           m.text += d.content;
+          if (m.toolHistory && m.toolHistory.length) m.afterTools = (m.afterTools || "") + d.content;
         }
         if (!frame) frame = requestAnimationFrame(paint);
       }
@@ -724,6 +760,7 @@ function loadDrawer(s = settings) {
   $("s-temp").value = s.temperature; $("s-topp").value = s.top_p; $("s-topk").value = s.top_k;
   $("s-max").value = s.max; $("s-seed").value = s.seed;
   $("s-show").setAttribute("aria-checked", String(!!s.show));
+  $("s-tools").setAttribute("aria-checked", String(s.tools === true));
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
   $("esp-row").hidden = !projectionLoaded();
   $("s-share").setAttribute("aria-checked", String(sharedOn));
@@ -772,15 +809,17 @@ function outputs() {
 }
 for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
+$("s-tools").onclick = () => $("s-tools").setAttribute("aria-checked", String($("s-tools").getAttribute("aria-checked") !== "true"));
 $("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
 $("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
 $("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($("s-share").getAttribute("aria-checked") !== "true"));
 $("s-reset").onclick = () => loadDrawer(DEFAULTS);
 $("s-apply").onclick = async () => {
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  settings = {thinking: sel ? sel.dataset.v : "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
+  settings = {thinking: sel ? sel.dataset.v : "none", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
               top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
               show: $("s-show").getAttribute("aria-checked") === "true",
+              tools: $("s-tools").getAttribute("aria-checked") === "true",
               esp: $("s-esp").getAttribute("aria-checked") === "true"};
   store.set("sampling", settings);
   const share = $("s-share").getAttribute("aria-checked") === "true";

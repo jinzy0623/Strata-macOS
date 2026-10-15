@@ -134,3 +134,10 @@ English: This is an initial Apple Silicon port with a working small-GGUF Metal
 inference path, the original Python API and Web UI. It does not port Strata's
 CUDA expert streaming or MTP features. A 16GB M4 cannot run the original 125B
 configuration. Start with Qwen2.5 0.5B Instruct Q4_K_M and a short context.
+
+For existing Qwen3.8-Flash-Next IQ2_XS files on a 64 GiB Apple Silicon Mac,
+see the [validated native llama-server trial](docs/QWEN-IQ2-XS-TRIAL.md).
+Run `./try-qwen-iq2-xs.command --open` to use this Strata UI with the installed
+current Metal engine. The bundled Python binding cannot read this model's
+quantization. This trial defaults to a 120,000-token context; CUDA expert caching and MTP remain
+unported.

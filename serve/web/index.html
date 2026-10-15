@@ -88,6 +88,10 @@
         <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
       </div>
 
+      <div class="st-card">
+        <span class="card-title">Connected tools</span>
+        <p class="muted" id="mcp-summary">Connecting…</p>
+      </div>
       <div class="metrics" id="metrics">
         <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
       </div>
@@ -190,6 +194,8 @@
       <label class="st-label" for="s-seed">Seed <output>empty = random</output></label>
       <input class="st-input" id="s-seed" type="number" min="1" step="1" placeholder="Random">
     </div>
+    <div class="toggle-row"><span>Use tools from MCP servers<br><span class="muted small">Read and write workspace files, and browse the web</span></span>
+      <button class="st-toggle" id="s-tools" role="switch" aria-checked="false" aria-label="Use tools from MCP servers"></button></div>
     <div class="toggle-row"><span>Show thinking<br><span class="muted small">expanded while it streams</span></span>
       <button class="st-toggle" id="s-show" role="switch" aria-checked="true" aria-label="Show thinking"></button></div>
     <div class="toggle-row" id="esp-row" hidden><span>Experimental speed projection<br><span class="muted small">the

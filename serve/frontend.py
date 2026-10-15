@@ -15,7 +15,10 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 """
 from __future__ import annotations
 
+import collections
 import json
+import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,8 +45,8 @@ class ChatTemplate:
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
-        return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
-                                    **kwargs)
+        return self.template.render(messages=drop_empty_assistant_turns(messages), tools=tools,
+                                    add_generation_prompt=add_generation_prompt, **kwargs)
 
 
 # ------------------------------------------------------------------------------------------------ requests
@@ -88,6 +91,37 @@ def budget_effort(tokens) -> dict:
 
 def _has_image(content) -> bool:
     return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS for p in content)
+
+
+def drop_empty_assistant_turns(messages: list[dict]) -> list[dict]:
+    """Leave finished assistant turns with no text, image or tool call out of the prompt, so the next reply does
+    not take an earlier empty reply as its example.  The final message is always kept.  Ported from upstream
+    Strata 0.1.40 (#843); STRATA_KEEP_EMPTY_TURNS=1 renders them as before."""
+    if os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1":
+        return messages
+    last = len(messages) - 1
+    return [m for i, m in enumerate(messages)
+            if i == last or not (isinstance(m, dict) and m.get("role") == "assistant"
+                                 and not _text_of(m.get("content")).strip()
+                                 and not _has_image(m.get("content")) and not m.get("tool_calls"))]
+
+
+def repeated_passage_coverage(text: str, window: int = 3000, min_len: int = 12, repeats: int = 3) -> float:
+    """How much of the last `window` characters of reasoning is made of lines or sentences of at least `min_len`
+    characters that appear at least `repeats` times in that window.  A model going round in circles ("- X? no."
+    over and over, the same syllable count re-checked forever) scores near 1; prose and code score near 0."""
+    tail = text[-window:]
+
+    def coverage(parts):
+        parts = [p.strip() for p in parts if p.strip()]
+        total = sum(len(p) for p in parts)
+        if not total:
+            return 0.0
+        counts = collections.Counter(p for p in parts if len(p) >= min_len)
+        return sum(len(p) * c for p, c in counts.items() if c >= repeats) / total
+
+    # Lines catch list-shaped loops ("- X? no." forever); sentences catch a line repeating "Let me try again."
+    return max(coverage(tail.split("\n")), coverage(re.split(r"(?<=[.!?;])\s+|\n", tail)))
 
 
 def _image_source(part: dict) -> str:
@@ -467,7 +501,7 @@ class OutputParser:
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
             out += self._close_scan()
-            out.append(Event("tool_call", call=self.scall))
+            # A partial call may have been displayed, but must never be executed.
             self.buf = ""
             self._reset_scan()
             return out
